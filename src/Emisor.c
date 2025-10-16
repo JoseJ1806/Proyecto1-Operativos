@@ -1,3 +1,6 @@
+#define _XOPEN_SOURCE 700
+#include <unistd.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ipc.h>
@@ -5,32 +8,28 @@
 #include <sys/sem.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 #include <errno.h>
 #include "shared.h"
 
-// Operación WAIT (P) sobre el semáforo
-void sem_wait_op(int sem_id, int sem_num) {
+// Semáforos tolerantes: NO salir aquí; el bucle maneja EIDRM/EINVAL
+static int sem_wait_raw(int sem_id, int sem_num) {
     struct sembuf op = {sem_num, -1, 0};
-    semop(sem_id, &op, 1);
+    return semop(sem_id, &op, 1);
 }
-
-// Operación SIGNAL (V) sobre el semáforo
-void sem_signal_op(int sem_id, int sem_num) {
+static int sem_signal_raw(int sem_id, int sem_num) {
     struct sembuf op = {sem_num, 1, 0};
-    semop(sem_id, &op, 1);
+    return semop(sem_id, &op, 1);
 }
 
-// Imprimir la información del carácter insertado con formato y color
-void print_table(int index, char c, time_t t) {
+static void print_table(int index, unsigned char c, time_t t) {
     printf("\033[1;34m---------------------------------------------\033[0m\n");
     printf("\033[1;32m| Índice | Valor ASCII | Hora de Inserción   |\033[0m\n");
-    printf("\033[1;33m| %6d | %12d | %s\033[0m", index, c, ctime(&t));
+    printf("\033[1;33m| %6d | %12u | %s\033[0m", index, c, ctime(&t));
     printf("\033[1;34m---------------------------------------------\033[0m\n");
 }
 
 int main(int argc, char *argv[]) {
-    // Validar parámetros
+    // Uso: emisor <id_memoria> <modo(0|1)> <clave_xor>
     if (argc != 4) {
         fprintf(stderr, "Uso: %s <id_memoria> <modo> <clave_xor>\n", argv[0]);
         fprintf(stderr, "Modo: 0 = Manual | 1 = Automático\n");
@@ -38,68 +37,108 @@ int main(int argc, char *argv[]) {
     }
 
     key_t shm_key = ftok(".", atoi(argv[1]));
+    if (shm_key == (key_t)-1) { perror("ftok"); exit(EXIT_FAILURE); }
+
     int mode = atoi(argv[2]); // 0 = manual, 1 = automático
     int xor_key = atoi(argv[3]);
 
-    // Conectarse a la memoria compartida existente
     int shm_id = shmget(shm_key, 0, 0666);
-    if (shm_id == -1) {
-        perror("Error al obtener memoria compartida");
-        exit(EXIT_FAILURE);
-    }
+    if (shm_id == -1) { perror("shmget"); exit(EXIT_FAILURE); }
 
     SharedMemory *mem = (SharedMemory *)shmat(shm_id, NULL, 0);
-    if (mem == (void *)-1) {
-        perror("Error al adjuntar memoria compartida");
-        exit(EXIT_FAILURE);
-    }
+    if (mem == (void *)-1) { perror("shmat"); exit(EXIT_FAILURE); }
 
-    // Conectarse al conjunto de semáforos
     int sem_id = semget(shm_key, 3, 0666);
-    if (sem_id == -1) {
-        perror("Error al obtener semáforos");
-        exit(EXIT_FAILURE);
-    }
+    if (sem_id == -1) { perror("semget"); shmdt(mem); exit(EXIT_FAILURE); }
 
-    // Abrir el archivo fuente (debe existir)
-    FILE *fp = fopen("texto_fuente.txt", "r");
-    if (!fp) {
-        perror("Error al abrir archivo fuente");
-        exit(EXIT_FAILURE);
+    FILE *fp = fopen(mem->fuente_path, "rb");
+    if (!fp) { perror("fopen fuente"); shmdt(mem); exit(EXIT_FAILURE); }
+
+    // Marcar emisor activo y total (con mutex)
+    if (sem_wait_raw(sem_id, 0) == -1) {
+        if (errno==EIDRM || errno==EINVAL) goto graceful_exit;
+        perror("semop wait mutex");
+        goto graceful_exit;
+    }
+    mem->emitters_active++;
+    mem->emitters_total++;
+    if (sem_signal_raw(sem_id, 0) == -1) {
+        if (errno==EIDRM || errno==EINVAL) goto graceful_exit;
+        perror("semop signal mutex");
+        goto graceful_exit;
     }
 
     printf("\nEmisor iniciado (modo %s)\n", mode == 1 ? "automático" : "manual");
 
-    char c;
-    while ((c = fgetc(fp)) != EOF) {
-        // Esperar a que haya espacio libre y acceso al mutex
-        sem_wait_op(sem_id, 1); // empty--
-        sem_wait_op(sem_id, 0); // mutex--
+    for (;;) {
+        // 1) Reservar posición global atómica
+        long long pos;
+        if (sem_wait_raw(sem_id, 0) == -1) {
+            if (errno==EIDRM || errno==EINVAL) { fprintf(stderr, "\n[INFO] IPC retirados (mutex next_pos). Saliendo emisor...\n"); break; }
+            perror("semop wait mutex next_pos"); break;
+        }
+        pos = mem->next_pos++;
+        if (sem_signal_raw(sem_id, 0) == -1) {
+            if (errno==EIDRM || errno==EINVAL) { fprintf(stderr, "\n[INFO] IPC retirados (unlock next_pos). Saliendo emisor...\n"); break; }
+            perror("semop signal mutex next_pos"); break;
+        }
 
-        // Insertar carácter en la memoria compartida
+        // 2) Leer byte del archivo
+        if (fseeko(fp, (off_t)pos, SEEK_SET) != 0) break;
+        int ch = fgetc(fp);
+        if (ch == EOF) break;
+        unsigned char c = (unsigned char)ch;
+
+        // 3) Escribir en buffer circular
+        if (sem_wait_raw(sem_id, 1) == -1) { // empty--
+            if (errno==EIDRM || errno==EINVAL) { fprintf(stderr, "\n[INFO] IPC retirados (empty). Saliendo emisor...\n"); break; }
+            perror("semop wait empty"); break;
+        }
+        if (sem_wait_raw(sem_id, 0) == -1) { // mutex--
+            if (errno==EIDRM || errno==EINVAL) { fprintf(stderr, "\n[INFO] IPC retirados (mutex write). Saliendo emisor...\n"); break; }
+            perror("semop wait mutex write"); break;
+        }
+
         int idx = mem->write_index;
-        mem->buffer[idx].ascii = c ^ xor_key;       // Codificación XOR
-        mem->buffer[idx].index = idx;
+        mem->buffer[idx].ascii     = (char)(c ^ xor_key);
+        mem->buffer[idx].index     = idx;
         mem->buffer[idx].timestamp = time(NULL);
-        mem->buffer[idx].is_full = 1;
+        mem->buffer[idx].is_full   = 1;
+        mem->buffer[idx].seq       = pos;
 
-        // Mostrar información formateada en consola
-        print_table(idx, mem->buffer[idx].ascii, mem->buffer[idx].timestamp);
+        mem->total_written++;  // contabilizar
 
-        // Actualizar índices y contadores
+        print_table(idx, (unsigned char)mem->buffer[idx].ascii, mem->buffer[idx].timestamp);
+
         mem->write_index = (idx + 1) % mem->size;
         mem->count++;
 
-        // Liberar semáforos
-        sem_signal_op(sem_id, 0); // mutex++
-        sem_signal_op(sem_id, 2); // full++
+        if (sem_signal_raw(sem_id, 0) == -1) { // mutex++
+            if (errno==EIDRM || errno==EINVAL) { fprintf(stderr, "\n[INFO] IPC retirados (unlock write). Saliendo emisor...\n"); break; }
+            perror("semop signal mutex write"); break;
+        }
+        if (sem_signal_raw(sem_id, 2) == -1) { // full++
+            if (errno==EIDRM || errno==EINVAL) { fprintf(stderr, "\n[INFO] IPC retirados (full++). Saliendo emisor...\n"); break; }
+            perror("semop signal full"); break;
+        }
 
-        // Control de modo
         if (mode == 0) {
             printf("\nPresione ENTER para enviar el siguiente carácter...\n");
             getchar();
         } else {
-            usleep(400000); // pausa de 0.4 segundos
+            struct timespec d = {0, 400000000L}; // 0.4 s
+            nanosleep(&d, NULL);
+        }
+    }
+
+graceful_exit:
+    // Marcar emisor inactivo si aún podemos
+    if (sem_wait_raw(sem_id, 0) == -1) {
+        if (!(errno==EIDRM || errno==EINVAL)) perror("semop wait mutex exit");
+    } else {
+        if (mem->emitters_active > 0) mem->emitters_active--;
+        if (sem_signal_raw(sem_id, 0) == -1) {
+            if (!(errno==EIDRM || errno==EINVAL)) perror("semop signal mutex exit");
         }
     }
 

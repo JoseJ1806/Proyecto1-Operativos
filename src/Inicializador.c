@@ -47,6 +47,10 @@ int main(int argc, char *argv[]) {
     mem->write_index = 0;
     mem->read_index = 0;
     mem->count = 0;
+    mem->next_pos = 0;
+    mem->next_to_flush = 0;
+    strncpy(mem->fuente_path, filename, sizeof(mem->fuente_path)-1);
+    mem->fuente_path[sizeof(mem->fuente_path)-1] = '\0';
     for (int i = 0; i < size; i++) {
         mem->buffer[i].is_full = 0;
     }
