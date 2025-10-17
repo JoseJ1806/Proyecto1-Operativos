@@ -42,7 +42,7 @@ $(BINDIR)/finalizador: $(OBJDIR)/finalizador.o | $(BINDIR)
 $(OBJDIR)/%.o: $(SRCDIR)/%.c $(HEADERS) | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# --- Ejecución de ejemplo (ajusta parámetros si querés) ---
+# --- Ejecución de ejemplo  ---
 run: all
 	@echo "== Ejemplo =="
 	@echo "1) Inicializando SHM/SEMs (ID=123, buffer=16, XOR=42, fuente=src/texto_fuente.txt)"
