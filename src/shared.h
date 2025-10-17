@@ -34,7 +34,7 @@ typedef struct {
     int emitters_total;        // Emisores que han iniciado alguna vez
     int receivers_total;       // Receptores que han iniciado alguna vez
 
-    long long next_to_flush;   // <<< NUEVO: próximo seq que debe escribirse en el archivo
+    long long next_to_flush;   // próximo seq que debe escribirse en el archivo
 
     char fuente_path[PATH_MAX]; // Ruta del archivo fuente
 
