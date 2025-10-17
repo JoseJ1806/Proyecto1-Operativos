@@ -132,7 +132,6 @@ int main(int argc, char *argv[]) {
     }
 
 graceful_exit:
-    // Marcar emisor inactivo si aún podemos
     if (sem_wait_raw(sem_id, 0) == -1) {
         if (!(errno==EIDRM || errno==EINVAL)) perror("semop wait mutex exit");
     } else {
