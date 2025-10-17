@@ -21,7 +21,7 @@ static int sem_signal_raw(int sem_id, int sem_num) {
     return semop(sem_id, &op, 1);
 }
 
-// print “elegante”
+//Info
 static void print_table(int index, char c_dec, time_t t_ins) {
     printf("\033[1;35m---------------------------------------------\033[0m\n");
     printf("\033[1;36m| Índice | Carácter | Hora de Inserción     |\033[0m\n");
